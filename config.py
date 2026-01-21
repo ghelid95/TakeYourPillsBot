@@ -19,3 +19,7 @@ TEMPERATURE = float(os.getenv('TEMPERATURE', '0.7'))
 
 # Logging
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+# Reminders
+REMINDER_INTERVAL = int(os.getenv('REMINDER_INTERVAL', '300'))  # 5 minutes in seconds
+DATABASE_PATH = os.getenv('DATABASE_PATH', 'reminders.db')
