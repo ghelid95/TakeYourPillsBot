@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Bot with Ollama
+After=network.target ollama.service
+Requires=ollama.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/telegram-llm-bot
+Environment="PATH=/root/telegram-llm-bot/venv/bin"
+EnvironmentFile=/root/telegram-llm-bot/.env
+ExecStart=/root/telegram-llm-bot/venv/bin/python /root/telegram-llm-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
