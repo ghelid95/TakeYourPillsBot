@@ -1,24 +1,19 @@
 import logging
 import re
-from datetime import datetime, date, timedelta
-import ollama
+from datetime import datetime, date
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
     filters,
     ContextTypes
 )
 from config import (
     TELEGRAM_TOKEN,
-    OLLAMA_MODEL,
-    OLLAMA_HOST,
-    MAX_CONTEXT_LENGTH,
-    MAX_RESPONSE_TOKENS,
-    TEMPERATURE,
     LOG_LEVEL,
     REMINDER_INTERVAL
 )
@@ -46,156 +41,209 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Хранилище разговоров (в продакшене лучше использовать БД)
-user_conversations = {}
+# Состояния для ConversationHandler
+WAITING_FOR_TIME = 1
+
+# Регионы часовых поясов
+TIMEZONE_REGIONS = {
+    'europe': 'Европа',
+    'asia': 'Азия',
+    'america': 'Америка',
+    'africa': 'Африка',
+    'australia': 'Австралия',
+    'pacific': 'Тихий океан',
+}
+
+# Популярные часовые пояса по регионам
+TIMEZONES_BY_REGION = {
+    'europe': [
+        ('Europe/Moscow', 'Москва (MSK)'),
+        ('Europe/Kaliningrad', 'Калининград (EET)'),
+        ('Europe/Samara', 'Самара (SAMT)'),
+        ('Europe/Kiev', 'Киев (EET)'),
+        ('Europe/Minsk', 'Минск (MSK)'),
+        ('Europe/London', 'Лондон (GMT)'),
+        ('Europe/Paris', 'Париж (CET)'),
+        ('Europe/Berlin', 'Берлин (CET)'),
+        ('Europe/Rome', 'Рим (CET)'),
+        ('Europe/Madrid', 'Мадрид (CET)'),
+        ('Europe/Warsaw', 'Варшава (CET)'),
+        ('Europe/Istanbul', 'Стамбул (TRT)'),
+    ],
+    'asia': [
+        ('Asia/Yekaterinburg', 'Екатеринбург (YEKT)'),
+        ('Asia/Omsk', 'Омск (OMST)'),
+        ('Asia/Novosibirsk', 'Новосибирск (NOVT)'),
+        ('Asia/Krasnoyarsk', 'Красноярск (KRAT)'),
+        ('Asia/Irkutsk', 'Иркутск (IRKT)'),
+        ('Asia/Yakutsk', 'Якутск (YAKT)'),
+        ('Asia/Vladivostok', 'Владивосток (VLAT)'),
+        ('Asia/Magadan', 'Магадан (MAGT)'),
+        ('Asia/Kamchatka', 'Камчатка (PETT)'),
+        ('Asia/Almaty', 'Алматы (ALMT)'),
+        ('Asia/Tashkent', 'Ташкент (UZT)'),
+        ('Asia/Baku', 'Баку (AZT)'),
+        ('Asia/Tbilisi', 'Тбилиси (GET)'),
+        ('Asia/Yerevan', 'Ереван (AMT)'),
+        ('Asia/Dubai', 'Дубай (GST)'),
+        ('Asia/Tokyo', 'Токио (JST)'),
+        ('Asia/Shanghai', 'Шанхай (CST)'),
+        ('Asia/Singapore', 'Сингапур (SGT)'),
+        ('Asia/Bangkok', 'Бангкок (ICT)'),
+        ('Asia/Kolkata', 'Индия (IST)'),
+    ],
+    'america': [
+        ('America/New_York', 'Нью-Йорк (EST)'),
+        ('America/Chicago', 'Чикаго (CST)'),
+        ('America/Denver', 'Денвер (MST)'),
+        ('America/Los_Angeles', 'Лос-Анджелес (PST)'),
+        ('America/Toronto', 'Торонто (EST)'),
+        ('America/Mexico_City', 'Мехико (CST)'),
+        ('America/Sao_Paulo', 'Сан-Паулу (BRT)'),
+        ('America/Buenos_Aires', 'Буэнос-Айрес (ART)'),
+        ('America/Lima', 'Лима (PET)'),
+        ('America/Bogota', 'Богота (COT)'),
+    ],
+    'africa': [
+        ('Africa/Cairo', 'Каир (EET)'),
+        ('Africa/Johannesburg', 'Йоханнесбург (SAST)'),
+        ('Africa/Lagos', 'Лагос (WAT)'),
+        ('Africa/Nairobi', 'Найроби (EAT)'),
+        ('Africa/Casablanca', 'Касабланка (WET)'),
+    ],
+    'australia': [
+        ('Australia/Sydney', 'Сидней (AEST)'),
+        ('Australia/Melbourne', 'Мельбурн (AEST)'),
+        ('Australia/Brisbane', 'Брисбен (AEST)'),
+        ('Australia/Perth', 'Перт (AWST)'),
+        ('Australia/Adelaide', 'Аделаида (ACST)'),
+    ],
+    'pacific': [
+        ('Pacific/Auckland', 'Окленд (NZST)'),
+        ('Pacific/Fiji', 'Фиджи (FJT)'),
+        ('Pacific/Honolulu', 'Гонолулу (HST)'),
+        ('Pacific/Guam', 'Гуам (ChST)'),
+    ],
+}
+
+
+def get_main_menu_keyboard():
+    """Создать клавиатуру главного меню"""
+    keyboard = [
+        [InlineKeyboardButton("Добавить напоминание", callback_data='menu_add')],
+        [InlineKeyboardButton("Мои напоминания", callback_data='menu_list')],
+        [InlineKeyboardButton("Часовой пояс", callback_data='menu_timezone')],
+        [InlineKeyboardButton("Помощь", callback_data='menu_help')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
     user_id = update.effective_user.id
-    user_conversations[user_id] = []
 
     await get_or_create_user(user_id)
+    user_tz = await get_user_timezone(user_id)
+    tz = pytz.timezone(user_tz)
+    current_time = datetime.now(tz).strftime('%H:%M')
 
     welcome_message = (
         'Привет! Я бот-напоминалка о приёме таблеток.\n\n'
-        f'Модель: {OLLAMA_MODEL}\n\n'
-        'Команды:\n'
-        '/start - начать заново\n'
-        '/clear - очистить историю\n'
-        '/help - помощь\n'
-        '/info - информация о боте\n\n'
-        'Напоминания:\n'
-        '/add_reminder HH:MM - добавить напоминание\n'
-        '/list_reminders - список напоминаний\n'
-        '/remove_reminder ID - удалить напоминание\n'
-        '/set_timezone Region/City - установить часовой пояс\n'
-        '/my_timezone - показать текущий часовой пояс'
+        f'Ваш часовой пояс: {user_tz}\n'
+        f'Текущее время: {current_time}\n\n'
+        'Выберите действие:'
     )
 
-    await update.message.reply_text(welcome_message)
+    await update.message.reply_text(welcome_message, reply_markup=get_main_menu_keyboard())
     logger.info(f"Пользователь {user_id} запустил бота")
 
 
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /clear - очистка истории"""
-    user_id = update.effective_user.id
-    user_conversations[user_id] = []
-    await update.message.reply_text('🗑 История диалога очищена!')
-    logger.info(f"Пользователь {user_id} очистил историю")
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать главное меню"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    user_tz = await get_user_timezone(user_id)
+    tz = pytz.timezone(user_tz)
+    current_time = datetime.now(tz).strftime('%H:%M')
+
+    text = (
+        'Главное меню\n\n'
+        f'Часовой пояс: {user_tz}\n'
+        f'Текущее время: {current_time}\n\n'
+        'Выберите действие:'
+    )
+
+    await query.edit_message_text(text, reply_markup=get_main_menu_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /help"""
+    keyboard = [[InlineKeyboardButton("« Назад в меню", callback_data='menu_back')]]
+
     help_text = (
         '*Справка по использованию*\n\n'
-        'Просто отправь мне текстовое сообщение, и я отвечу используя локальную LLM.\n\n'
-        '*Основные команды:*\n'
-        '/start - начать диалог заново\n'
-        '/clear - очистить историю разговора\n'
-        '/info - информация о модели\n'
-        '/help - эта справка\n\n'
-        '*Команды напоминаний:*\n'
-        '/add\\_reminder HH:MM - добавить напоминание (пример: /add\\_reminder 09:00)\n'
-        '/list\\_reminders - показать все напоминания\n'
-        '/remove\\_reminder ID - удалить напоминание по ID\n'
-        '/set\\_timezone Region/City - установить часовой пояс (пример: /set\\_timezone Europe/Moscow)\n'
-        '/my\\_timezone - показать текущий часовой пояс'
+        'Этот бот напоминает о приёме таблеток.\n\n'
+        '*Как пользоваться:*\n'
+        '1. Установите свой часовой пояс\n'
+        '2. Добавьте напоминания на нужное время\n'
+        '3. Когда придёт время, бот пришлёт напоминание\n'
+        '4. Нажмите кнопку, когда примете таблетки\n\n'
+        'Бот будет напоминать каждые 5 минут, пока вы не подтвердите приём.'
     )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await update.message.reply_text(help_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /info - информация о боте"""
-    info_text = (
-        f'🤖 *Информация о боте*\n\n'
-        f'Модель: `{OLLAMA_MODEL}`\n'
-        f'Хост: `{OLLAMA_HOST}`\n'
-        f'Максимальный контекст: {MAX_CONTEXT_LENGTH} токенов\n'
-        f'Максимальный ответ: {MAX_RESPONSE_TOKENS} токенов\n'
-        f'Температура: {TEMPERATURE}'
+async def menu_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать справку через меню"""
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [[InlineKeyboardButton("« Назад в меню", callback_data='menu_back')]]
+
+    help_text = (
+        '*Справка по использованию*\n\n'
+        'Этот бот напоминает о приёме таблеток.\n\n'
+        '*Как пользоваться:*\n'
+        '1. Установите свой часовой пояс\n'
+        '2. Добавьте напоминания на нужное время\n'
+        '3. Когда придёт время, бот пришлёт напоминание\n'
+        '4. Нажмите кнопку, когда примете таблетки\n\n'
+        'Бот будет напоминать каждые 5 минут, пока вы не подтвердите приём.'
     )
-    await update.message.reply_text(info_text, parse_mode='Markdown')
+    await query.edit_message_text(help_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстовых сообщений"""
+async def menu_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать добавление напоминания"""
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [[InlineKeyboardButton("« Отмена", callback_data='menu_back')]]
+
+    await query.edit_message_text(
+        'Введите время напоминания в формате ЧЧ:ММ\n\n'
+        'Например: 09:00 или 21:30',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    return WAITING_FOR_TIME
+
+
+async def receive_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить время от пользователя"""
     user_id = update.effective_user.id
-    user_message = update.message.text
-
-    logger.info(f"Получено сообщение от {user_id}: {user_message[:50]}...")
-
-    # Инициализация истории для нового пользователя
-    if user_id not in user_conversations:
-        user_conversations[user_id] = []
-
-    # Добавление сообщения пользователя
-    user_conversations[user_id].append({
-        'role': 'user',
-        'content': user_message
-    })
-
-    # Ограничение истории (последние 10 сообщений = 5 пар)
-    if len(user_conversations[user_id]) > 10:
-        user_conversations[user_id] = user_conversations[user_id][-10:]
-
-    # Индикатор печати
-    await update.message.chat.send_action(action="typing")
-
-    try:
-        # Настройка клиента Ollama
-        client = ollama.Client(host=OLLAMA_HOST)
-
-        # Запрос к модели
-        response = client.chat(
-            model=OLLAMA_MODEL,
-            messages=user_conversations[user_id],
-            options={
-                'num_ctx': MAX_CONTEXT_LENGTH,
-                'num_predict': MAX_RESPONSE_TOKENS,
-                'temperature': TEMPERATURE,
-            }
-        )
-
-        bot_response = response['message']['content']
-
-        # Добавление ответа в историю
-        user_conversations[user_id].append({
-            'role': 'assistant',
-            'content': bot_response
-        })
-
-        # Отправка ответа
-        await update.message.reply_text(bot_response)
-        logger.info(f"Ответ отправлен пользователю {user_id}")
-
-    except Exception as e:
-        logger.error(f"Ошибка при обработке сообщения: {e}", exc_info=True)
-        await update.message.reply_text(
-            'Произошла ошибка при обработке запроса.\n'
-            'Попробуйте позже или используйте /clear для очистки истории.'
-        )
-
-
-async def add_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /add_reminder - добавить напоминание"""
-    user_id = update.effective_user.id
-
-    if not context.args:
-        await update.message.reply_text(
-            'Укажите время в формате HH:MM\n'
-            'Пример: /add_reminder 09:00'
-        )
-        return
-
-    time_str = context.args[0]
+    time_str = update.message.text.strip()
 
     if not re.match(r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$', time_str):
+        keyboard = [[InlineKeyboardButton("« Отмена", callback_data='menu_back')]]
         await update.message.reply_text(
-            'Неверный формат времени. Используйте HH:MM\n'
-            'Пример: /add_reminder 09:00'
+            'Неверный формат времени. Используйте ЧЧ:ММ\n'
+            'Например: 09:00 или 21:30',
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        return
+        return WAITING_FOR_TIME
 
     if len(time_str) == 4:
         time_str = '0' + time_str
@@ -204,102 +252,165 @@ async def add_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYP
     user_tz = await get_user_timezone(user_id)
 
     await update.message.reply_text(
-        f'Напоминание добавлено!\n'
-        f'ID: {reminder_id}\n'
-        f'Время: {time_str} ({user_tz})'
+        f'Напоминание добавлено!\n\n'
+        f'Время: {time_str}\n'
+        f'Часовой пояс: {user_tz}',
+        reply_markup=get_main_menu_keyboard()
     )
     logger.info(f"Пользователь {user_id} добавил напоминание на {time_str}")
 
+    return ConversationHandler.END
 
-async def list_reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /list_reminders - список напоминаний"""
-    user_id = update.effective_user.id
+
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена разговора"""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await show_main_menu(update, context)
+    return ConversationHandler.END
+
+
+async def menu_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список напоминаний с кнопками удаления"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
     reminders = await get_user_reminders(user_id)
     user_tz = await get_user_timezone(user_id)
 
     if not reminders:
-        await update.message.reply_text(
-            'У вас нет активных напоминаний.\n'
-            'Добавьте: /add_reminder HH:MM'
+        keyboard = [[InlineKeyboardButton("« Назад в меню", callback_data='menu_back')]]
+        await query.edit_message_text(
+            'У вас пока нет напоминаний.\n\n'
+            'Нажмите "Добавить напоминание" в меню.',
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
 
-    text = f'*Ваши напоминания* (часовой пояс: {user_tz}):\n\n'
+    text = f'*Ваши напоминания*\nЧасовой пояс: {user_tz}\n\n'
+
+    keyboard = []
     for r in reminders:
-        text += f'ID: {r["id"]} - {r["time"]}\n'
+        text += f'• {r["time"]}\n'
+        keyboard.append([
+            InlineKeyboardButton(f'Удалить {r["time"]}', callback_data=f'delete_{r["id"]}')
+        ])
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    keyboard.append([InlineKeyboardButton("« Назад в меню", callback_data='menu_back')])
+
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def remove_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /remove_reminder - удалить напоминание"""
-    user_id = update.effective_user.id
+async def delete_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удалить напоминание"""
+    query = update.callback_query
+    await query.answer()
 
-    if not context.args:
-        await update.message.reply_text(
-            'Укажите ID напоминания\n'
-            'Пример: /remove_reminder 1\n'
-            'Список напоминаний: /list_reminders'
-        )
-        return
-
-    try:
-        reminder_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text('ID должен быть числом')
-        return
+    user_id = query.from_user.id
+    reminder_id = int(query.data.replace('delete_', ''))
 
     success = await remove_reminder(user_id, reminder_id)
 
     if success:
-        await update.message.reply_text(f'Напоминание {reminder_id} удалено')
         logger.info(f"Пользователь {user_id} удалил напоминание {reminder_id}")
-    else:
-        await update.message.reply_text('Напоминание не найдено')
 
+    # Показать обновлённый список
+    reminders = await get_user_reminders(user_id)
+    user_tz = await get_user_timezone(user_id)
 
-async def set_timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /set_timezone - установить часовой пояс"""
-    user_id = update.effective_user.id
-
-    if not context.args:
-        await update.message.reply_text(
-            'Укажите часовой пояс в формате Region/City\n'
-            'Примеры:\n'
-            '/set_timezone Europe/Moscow\n'
-            '/set_timezone America/New_York\n'
-            '/set_timezone Asia/Tokyo'
+    if not reminders:
+        keyboard = [[InlineKeyboardButton("« Назад в меню", callback_data='menu_back')]]
+        await query.edit_message_text(
+            'Напоминание удалено!\n\n'
+            'У вас больше нет напоминаний.',
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
 
-    timezone_str = context.args[0]
+    text = f'Напоминание удалено!\n\n*Ваши напоминания*\nЧасовой пояс: {user_tz}\n\n'
 
-    try:
-        pytz.timezone(timezone_str)
-    except pytz.UnknownTimeZoneError:
-        await update.message.reply_text(
-            f'Неизвестный часовой пояс: {timezone_str}\n'
-            'Используйте формат Region/City\n'
-            'Например: Europe/Moscow, America/New_York'
-        )
-        return
+    keyboard = []
+    for r in reminders:
+        text += f'• {r["time"]}\n'
+        keyboard.append([
+            InlineKeyboardButton(f'Удалить {r["time"]}', callback_data=f'delete_{r["id"]}')
+        ])
 
-    await set_user_timezone(user_id, timezone_str)
-    await update.message.reply_text(f'Часовой пояс установлен: {timezone_str}')
-    logger.info(f"Пользователь {user_id} установил часовой пояс {timezone_str}")
+    keyboard.append([InlineKeyboardButton("« Назад в меню", callback_data='menu_back')])
+
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def my_timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /my_timezone - показать текущий часовой пояс"""
-    user_id = update.effective_user.id
-    timezone = await get_user_timezone(user_id)
+async def menu_timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать меню выбора часового пояса"""
+    query = update.callback_query
+    await query.answer()
 
-    tz = pytz.timezone(timezone)
+    user_id = query.from_user.id
+    current_tz = await get_user_timezone(user_id)
+    tz = pytz.timezone(current_tz)
     current_time = datetime.now(tz).strftime('%H:%M')
 
-    await update.message.reply_text(
-        f'Ваш часовой пояс: {timezone}\n'
-        f'Текущее время: {current_time}'
+    keyboard = []
+    for region_id, region_name in TIMEZONE_REGIONS.items():
+        keyboard.append([InlineKeyboardButton(region_name, callback_data=f'tz_region_{region_id}')])
+
+    keyboard.append([InlineKeyboardButton("« Назад в меню", callback_data='menu_back')])
+
+    await query.edit_message_text(
+        f'*Выбор часового пояса*\n\n'
+        f'Текущий: {current_tz}\n'
+        f'Время: {current_time}\n\n'
+        'Выберите регион:',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def timezone_region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать часовые пояса региона"""
+    query = update.callback_query
+    await query.answer()
+
+    region = query.data.replace('tz_region_', '')
+    region_name = TIMEZONE_REGIONS.get(region, region)
+    timezones = TIMEZONES_BY_REGION.get(region, [])
+
+    keyboard = []
+    for tz_id, tz_name in timezones:
+        keyboard.append([InlineKeyboardButton(tz_name, callback_data=f'tz_set_{tz_id}')])
+
+    keyboard.append([InlineKeyboardButton("« Назад к регионам", callback_data='menu_timezone')])
+
+    await query.edit_message_text(
+        f'*{region_name}*\n\nВыберите город:',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def timezone_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Установить выбранный часовой пояс"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    timezone_str = query.data.replace('tz_set_', '')
+
+    await set_user_timezone(user_id, timezone_str)
+
+    tz = pytz.timezone(timezone_str)
+    current_time = datetime.now(tz).strftime('%H:%M')
+
+    logger.info(f"Пользователь {user_id} установил часовой пояс {timezone_str}")
+
+    await query.edit_message_text(
+        f'Часовой пояс установлен!\n\n'
+        f'Часовой пояс: {timezone_str}\n'
+        f'Текущее время: {current_time}',
+        reply_markup=get_main_menu_keyboard()
     )
 
 
@@ -455,29 +566,48 @@ async def post_init(application: Application):
 
 def main():
     """Запуск бота"""
-    logger.info(f"Запуск бота с моделью {OLLAMA_MODEL} на {OLLAMA_HOST}")
+    logger.info("Запуск бота напоминаний о таблетках")
 
     # Создание приложения
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
+    # ConversationHandler для добавления напоминания
+    add_reminder_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(menu_add_callback, pattern='^menu_add$')],
+        states={
+            WAITING_FOR_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_time),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            CommandHandler("start", start),
+        ],
+    )
+
     # Регистрация обработчиков команд
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("clear", clear))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("info", info_command))
 
-    # Регистрация обработчиков напоминаний
-    application.add_handler(CommandHandler("add_reminder", add_reminder_command))
-    application.add_handler(CommandHandler("list_reminders", list_reminders_command))
-    application.add_handler(CommandHandler("remove_reminder", remove_reminder_command))
-    application.add_handler(CommandHandler("set_timezone", set_timezone_command))
-    application.add_handler(CommandHandler("my_timezone", my_timezone_command))
+    # Регистрация ConversationHandler
+    application.add_handler(add_reminder_handler)
 
-    # Регистрация обработчика callback-кнопок
+    # Регистрация обработчиков меню
+    application.add_handler(CallbackQueryHandler(show_main_menu, pattern='^menu_back$'))
+    application.add_handler(CallbackQueryHandler(menu_help_callback, pattern='^menu_help$'))
+    application.add_handler(CallbackQueryHandler(menu_list_callback, pattern='^menu_list$'))
+    application.add_handler(CallbackQueryHandler(menu_timezone_callback, pattern='^menu_timezone$'))
+
+    # Регистрация обработчиков часовых поясов
+    application.add_handler(CallbackQueryHandler(timezone_region_callback, pattern=r'^tz_region_'))
+    application.add_handler(CallbackQueryHandler(timezone_set_callback, pattern=r'^tz_set_'))
+
+    # Регистрация обработчика удаления напоминаний
+    application.add_handler(CallbackQueryHandler(delete_reminder_callback, pattern=r'^delete_\d+$'))
+
+    # Регистрация обработчика подтверждения приёма таблеток
     application.add_handler(CallbackQueryHandler(took_pills_callback, pattern=r'^took_pills_\d+$'))
-
-    # Регистрация обработчика текстовых сообщений
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Запуск бота
     logger.info("Бот успешно запущен!")
