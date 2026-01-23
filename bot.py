@@ -2,7 +2,7 @@ import logging
 import re
 from datetime import datetime, date
 import pytz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -128,7 +128,7 @@ TIMEZONES_BY_REGION = {
 
 
 def get_main_menu_keyboard():
-    """Создать клавиатуру главного меню"""
+    """Создать инлайн-клавиатуру главного меню"""
     keyboard = [
         [InlineKeyboardButton("Добавить напоминание", callback_data='menu_add')],
         [InlineKeyboardButton("Мои напоминания", callback_data='menu_list')],
@@ -136,6 +136,12 @@ def get_main_menu_keyboard():
         [InlineKeyboardButton("Помощь", callback_data='menu_help')],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def get_persistent_keyboard():
+    """Создать постоянную клавиатуру под полем ввода"""
+    keyboard = [[KeyboardButton("Меню")]]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,8 +160,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Выберите действие:'
     )
 
-    await update.message.reply_text(welcome_message, reply_markup=get_main_menu_keyboard())
+    # Отправляем сообщение с постоянной клавиатурой
+    await update.message.reply_text(
+        welcome_message,
+        reply_markup=get_persistent_keyboard()
+    )
+    # Отправляем инлайн-меню
+    await update.message.reply_text(
+        'Главное меню:',
+        reply_markup=get_main_menu_keyboard()
+    )
     logger.info(f"Пользователь {user_id} запустил бота")
+
+
+async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатия кнопки Меню"""
+    user_id = update.effective_user.id
+    user_tz = await get_user_timezone(user_id)
+    tz = pytz.timezone(user_tz)
+    current_time = datetime.now(tz).strftime('%H:%M')
+
+    text = (
+        'Главное меню\n\n'
+        f'Часовой пояс: {user_tz}\n'
+        f'Текущее время: {current_time}\n\n'
+        'Выберите действие:'
+    )
+
+    await update.message.reply_text(text, reply_markup=get_main_menu_keyboard())
 
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -576,19 +608,23 @@ def main():
         entry_points=[CallbackQueryHandler(menu_add_callback, pattern='^menu_add$')],
         states={
             WAITING_FOR_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_time),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^Меню$'), receive_time),
                 CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
             ],
         },
         fallbacks=[
             CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
             CommandHandler("start", start),
+            MessageHandler(filters.Regex('^Меню$'), menu_button_handler),
         ],
     )
 
     # Регистрация обработчиков команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+
+    # Регистрация обработчика кнопки "Меню"
+    application.add_handler(MessageHandler(filters.Regex('^Меню$'), menu_button_handler))
 
     # Регистрация ConversationHandler
     application.add_handler(add_reminder_handler)
