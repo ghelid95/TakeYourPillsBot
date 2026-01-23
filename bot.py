@@ -30,7 +30,15 @@ from database import (
     create_or_update_reminder_state,
     acknowledge_reminder,
     is_reminder_acknowledged,
-    get_reminder_by_id
+    get_reminder_by_id,
+    should_reminder_trigger,
+    get_frequency_description,
+    get_weekend_work_status,
+    set_weekend_work_status,
+    create_work_question,
+    get_pending_work_questions,
+    get_advanced_daily_reminders_needing_questions,
+    get_reminder_time_for_date
 )
 from meme_api import fetch_random_meme, get_fallback_message
 
@@ -42,7 +50,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Состояния для ConversationHandler
-WAITING_FOR_TIME = 1
+SELECTING_FREQUENCY = 1
+SELECTING_DAY_OF_WEEK = 2
+SELECTING_DAY_OF_MONTH = 3
+SELECTING_MONTH_FALLBACK = 4
+WAITING_FOR_TIME = 5
+# Состояния для расширенных ежедневных напоминаний
+SELECTING_DAILY_MODE = 6
+WAITING_FOR_EVEN_TIME = 7
+WAITING_FOR_ODD_TIME = 8
+SELECTING_WEEKEND_OVERRIDE = 9
+WAITING_FOR_WEEKEND_NO_WORK_TIME = 10
+WAITING_FOR_WEEKEND_WITH_WORK_TIME = 11
+WAITING_FOR_ASK_WORK_TIME = 12
+
+# Названия дней недели
+DAYS_OF_WEEK = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
+DAYS_OF_WEEK_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
 
 # Регионы часовых поясов
 TIMEZONE_REGIONS = {
@@ -248,23 +272,462 @@ async def menu_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def menu_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начать добавление напоминания"""
+    """Начать добавление напоминания - выбор частоты"""
     query = update.callback_query
     await query.answer()
 
-    keyboard = [[InlineKeyboardButton("« Отмена", callback_data='menu_back')]]
+    # Сбрасываем данные напоминания
+    context.user_data['reminder'] = {}
+
+    keyboard = [
+        [InlineKeyboardButton("Ежедневно", callback_data='freq_daily')],
+        [InlineKeyboardButton("Еженедельно", callback_data='freq_weekly')],
+        [InlineKeyboardButton("Ежемесячно", callback_data='freq_monthly')],
+        [InlineKeyboardButton("« Отмена", callback_data='menu_back')],
+    ]
 
     await query.edit_message_text(
-        'Введите время напоминания в формате ЧЧ:ММ\n\n'
+        '*Новое напоминание*\n\n'
+        'Выберите частоту напоминания:',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    return SELECTING_FREQUENCY
+
+
+async def select_frequency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора частоты"""
+    query = update.callback_query
+    await query.answer()
+
+    frequency = query.data.replace('freq_', '')
+    context.user_data['reminder']['frequency'] = frequency
+
+    if frequency == 'daily':
+        # Выбор режима: простой или расширенный
+        keyboard = [
+            [InlineKeyboardButton("Простой (одно время)", callback_data='daily_simple')],
+            [InlineKeyboardButton("Расширенный (чёт/нечет + выходные)", callback_data='daily_advanced')],
+            [InlineKeyboardButton("« Назад", callback_data='back_to_frequency')],
+        ]
+        await query.edit_message_text(
+            '*Новое напоминание*\n'
+            'Частота: Ежедневно\n\n'
+            'Выберите режим настройки:',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_DAILY_MODE
+
+    elif frequency == 'weekly':
+        # Выбор дня недели
+        keyboard = []
+        for i, day in enumerate(DAYS_OF_WEEK):
+            keyboard.append([InlineKeyboardButton(day, callback_data=f'dow_{i}')])
+        keyboard.append([InlineKeyboardButton("« Назад", callback_data='back_to_frequency')])
+
+        await query.edit_message_text(
+            '*Новое напоминание*\n'
+            'Частота: Еженедельно\n\n'
+            'Выберите день недели:',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_DAY_OF_WEEK
+
+    elif frequency == 'monthly':
+        # Выбор дня месяца
+        keyboard = []
+        row = []
+        for day in range(1, 32):
+            row.append(InlineKeyboardButton(str(day), callback_data=f'dom_{day}'))
+            if len(row) == 7:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("« Назад", callback_data='back_to_frequency')])
+
+        await query.edit_message_text(
+            '*Новое напоминание*\n'
+            'Частота: Ежемесячно\n\n'
+            'Выберите день месяца:',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_DAY_OF_MONTH
+
+
+async def back_to_frequency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вернуться к выбору частоты"""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data['reminder'] = {}
+
+    keyboard = [
+        [InlineKeyboardButton("Ежедневно", callback_data='freq_daily')],
+        [InlineKeyboardButton("Еженедельно", callback_data='freq_weekly')],
+        [InlineKeyboardButton("Ежемесячно", callback_data='freq_monthly')],
+        [InlineKeyboardButton("« Отмена", callback_data='menu_back')],
+    ]
+
+    await query.edit_message_text(
+        '*Новое напоминание*\n\n'
+        'Выберите частоту напоминания:',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    return SELECTING_FREQUENCY
+
+
+async def select_day_of_week_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора дня недели"""
+    query = update.callback_query
+    await query.answer()
+
+    day_of_week = int(query.data.replace('dow_', ''))
+    context.user_data['reminder']['day_of_week'] = day_of_week
+
+    keyboard = [[InlineKeyboardButton("« Назад", callback_data='back_to_frequency')]]
+
+    await query.edit_message_text(
+        f'*Новое напоминание*\n'
+        f'Частота: Еженедельно ({DAYS_OF_WEEK[day_of_week]})\n\n'
+        'Введите время в формате ЧЧ:ММ\n'
         'Например: 09:00 или 21:30',
+        parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
     return WAITING_FOR_TIME
 
 
+async def select_day_of_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора дня месяца"""
+    query = update.callback_query
+    await query.answer()
+
+    day_of_month = int(query.data.replace('dom_', ''))
+    context.user_data['reminder']['day_of_month'] = day_of_month
+
+    # Если выбран день > 28, спрашиваем про fallback
+    if day_of_month > 28:
+        keyboard = [
+            [InlineKeyboardButton("Последний день месяца", callback_data='fallback_last_day')],
+            [InlineKeyboardButton("Пропустить месяц", callback_data='fallback_skip')],
+            [InlineKeyboardButton("« Назад", callback_data='back_to_frequency')],
+        ]
+
+        await query.edit_message_text(
+            f'*Новое напоминание*\n'
+            f'Частота: Ежемесячно ({day_of_month}-е число)\n\n'
+            f'Что делать, если {day_of_month}-го числа нет в месяце?\n'
+            '(например, 30 февраля)',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_MONTH_FALLBACK
+    else:
+        # Дни 1-28 есть в каждом месяце
+        context.user_data['reminder']['month_fallback'] = 'last_day'
+
+        keyboard = [[InlineKeyboardButton("« Назад", callback_data='back_to_frequency')]]
+
+        await query.edit_message_text(
+            f'*Новое напоминание*\n'
+            f'Частота: Ежемесячно ({day_of_month}-е число)\n\n'
+            'Введите время в формате ЧЧ:ММ\n'
+            'Например: 09:00 или 21:30',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+        return WAITING_FOR_TIME
+
+
+async def select_month_fallback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора fallback для месяца"""
+    query = update.callback_query
+    await query.answer()
+
+    fallback = query.data.replace('fallback_', '')
+    context.user_data['reminder']['month_fallback'] = fallback
+
+    day_of_month = context.user_data['reminder']['day_of_month']
+    fallback_text = 'последний день месяца' if fallback == 'last_day' else 'пропустить'
+
+    keyboard = [[InlineKeyboardButton("« Назад", callback_data='back_to_frequency')]]
+
+    await query.edit_message_text(
+        f'*Новое напоминание*\n'
+        f'Частота: Ежемесячно ({day_of_month}-е число)\n'
+        f'Если дня нет: {fallback_text}\n\n'
+        'Введите время в формате ЧЧ:ММ\n'
+        'Например: 09:00 или 21:30',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    return WAITING_FOR_TIME
+
+
+# --- Обработчики для расширенных ежедневных напоминаний ---
+
+async def select_daily_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора режима ежедневного напоминания"""
+    query = update.callback_query
+    await query.answer()
+
+    mode = query.data.replace('daily_', '')
+    context.user_data['reminder']['daily_mode'] = mode
+
+    if mode == 'simple':
+        keyboard = [[InlineKeyboardButton("« Назад", callback_data='back_to_frequency')]]
+        await query.edit_message_text(
+            '*Новое напоминание*\n'
+            'Частота: Ежедневно (простой)\n\n'
+            'Введите время в формате ЧЧ:ММ\n'
+            'Например: 09:00 или 21:30',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAITING_FOR_TIME
+
+    else:  # advanced
+        keyboard = [[InlineKeyboardButton("« Назад", callback_data='back_to_frequency')]]
+        await query.edit_message_text(
+            '*Новое напоминание*\n'
+            'Частота: Ежедневно (расширенный)\n\n'
+            '*Шаг 1 из 5:* Время для ЧЁТНЫХ дней месяца\n'
+            '(2, 4, 6, 8... числа)\n\n'
+            'Введите время в формате ЧЧ:ММ:',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAITING_FOR_EVEN_TIME
+
+
+async def receive_even_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить время для чётных дней"""
+    time_str = update.message.text.strip()
+
+    if not re.match(r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$', time_str):
+        keyboard = [[InlineKeyboardButton("« Отмена", callback_data='menu_back')]]
+        await update.message.reply_text(
+            'Неверный формат времени. Используйте ЧЧ:ММ\n'
+            'Например: 09:00 или 21:30',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAITING_FOR_EVEN_TIME
+
+    if len(time_str) == 4:
+        time_str = '0' + time_str
+
+    context.user_data['reminder']['even_day_time'] = time_str
+
+    keyboard = [[InlineKeyboardButton("« Назад", callback_data='back_to_frequency')]]
+    await update.message.reply_text(
+        '*Новое напоминание*\n'
+        'Частота: Ежедневно (расширенный)\n\n'
+        f'Чётные дни: {time_str}\n\n'
+        '*Шаг 2 из 5:* Время для НЕЧЁТНЫХ дней месяца\n'
+        '(1, 3, 5, 7... числа)\n\n'
+        'Введите время в формате ЧЧ:ММ:',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_FOR_ODD_TIME
+
+
+async def receive_odd_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить время для нечётных дней"""
+    time_str = update.message.text.strip()
+
+    if not re.match(r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$', time_str):
+        keyboard = [[InlineKeyboardButton("« Отмена", callback_data='menu_back')]]
+        await update.message.reply_text(
+            'Неверный формат времени. Используйте ЧЧ:ММ',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAITING_FOR_ODD_TIME
+
+    if len(time_str) == 4:
+        time_str = '0' + time_str
+
+    context.user_data['reminder']['odd_day_time'] = time_str
+    even_time = context.user_data['reminder']['even_day_time']
+
+    keyboard = [
+        [InlineKeyboardButton("Да, настроить выходные", callback_data='weekend_yes')],
+        [InlineKeyboardButton("Нет, использовать чёт/нечет", callback_data='weekend_no')],
+        [InlineKeyboardButton("« Назад", callback_data='back_to_frequency')],
+    ]
+    await update.message.reply_text(
+        '*Новое напоминание*\n'
+        'Частота: Ежедневно (расширенный)\n\n'
+        f'Чётные дни: {even_time}\n'
+        f'Нечётные дни: {time_str}\n\n'
+        '*Шаг 3 из 5:* Настроить особое время для выходных?\n\n'
+        'Это позволит задать отдельное время для Сб и Вс,\n'
+        'которое заменит правило чёт/нечет.',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return SELECTING_WEEKEND_OVERRIDE
+
+
+async def select_weekend_override_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора настройки выходных"""
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data.replace('weekend_', '')
+    even_time = context.user_data['reminder']['even_day_time']
+    odd_time = context.user_data['reminder']['odd_day_time']
+
+    if choice == 'no':
+        context.user_data['reminder']['weekend_override'] = False
+        # Сохраняем напоминание
+        return await save_advanced_daily_reminder(update, context)
+
+    else:  # yes
+        context.user_data['reminder']['weekend_override'] = True
+        keyboard = [[InlineKeyboardButton("« Назад", callback_data='back_to_frequency')]]
+        await query.edit_message_text(
+            '*Новое напоминание*\n'
+            'Частота: Ежедневно (расширенный)\n\n'
+            f'Чётные дни: {even_time}\n'
+            f'Нечётные дни: {odd_time}\n\n'
+            '*Шаг 4 из 5:* Время в выходные БЕЗ работы\n\n'
+            'Введите время в формате ЧЧ:ММ:',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAITING_FOR_WEEKEND_NO_WORK_TIME
+
+
+async def receive_weekend_no_work_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить время для выходных без работы"""
+    time_str = update.message.text.strip()
+
+    if not re.match(r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$', time_str):
+        keyboard = [[InlineKeyboardButton("« Отмена", callback_data='menu_back')]]
+        await update.message.reply_text(
+            'Неверный формат времени. Используйте ЧЧ:ММ',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAITING_FOR_WEEKEND_NO_WORK_TIME
+
+    if len(time_str) == 4:
+        time_str = '0' + time_str
+
+    context.user_data['reminder']['weekend_time_no_work'] = time_str
+    even_time = context.user_data['reminder']['even_day_time']
+    odd_time = context.user_data['reminder']['odd_day_time']
+
+    keyboard = [[InlineKeyboardButton("« Назад", callback_data='back_to_frequency')]]
+    await update.message.reply_text(
+        '*Новое напоминание*\n'
+        'Частота: Ежедневно (расширенный)\n\n'
+        f'Чётные дни: {even_time}\n'
+        f'Нечётные дни: {odd_time}\n'
+        f'Выходные (без работы): {time_str}\n\n'
+        '*Шаг 5 из 5:* Время в выходные С работой\n\n'
+        'Введите время в формате ЧЧ:ММ:',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_FOR_WEEKEND_WITH_WORK_TIME
+
+
+async def receive_weekend_with_work_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить время для выходных с работой"""
+    time_str = update.message.text.strip()
+
+    if not re.match(r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$', time_str):
+        keyboard = [[InlineKeyboardButton("« Отмена", callback_data='menu_back')]]
+        await update.message.reply_text(
+            'Неверный формат времени. Используйте ЧЧ:ММ',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAITING_FOR_WEEKEND_WITH_WORK_TIME
+
+    if len(time_str) == 4:
+        time_str = '0' + time_str
+
+    context.user_data['reminder']['weekend_time_with_work'] = time_str
+
+    # Сохраняем напоминание
+    return await save_advanced_daily_reminder(update, context)
+
+
+async def save_advanced_daily_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохранить расширенное ежедневное напоминание"""
+    user_id = update.effective_user.id
+    reminder_data = context.user_data.get('reminder', {})
+
+    even_time = reminder_data.get('even_day_time')
+    odd_time = reminder_data.get('odd_day_time')
+    weekend_override = reminder_data.get('weekend_override', False)
+    weekend_no_work = reminder_data.get('weekend_time_no_work')
+    weekend_with_work = reminder_data.get('weekend_time_with_work')
+
+    await add_reminder(
+        user_id=user_id,
+        time=even_time,  # Основное время (для обратной совместимости)
+        frequency='daily',
+        daily_mode='advanced',
+        even_day_time=even_time,
+        odd_day_time=odd_time,
+        weekend_override=weekend_override,
+        weekend_time_no_work=weekend_no_work,
+        weekend_time_with_work=weekend_with_work,
+        ask_work_time='18:00'  # По умолчанию спрашиваем в 18:00
+    )
+
+    user_tz = await get_user_timezone(user_id)
+
+    # Формируем описание
+    desc = (
+        f'Напоминание добавлено!\n\n'
+        f'Режим: Ежедневно (расширенный)\n'
+        f'Чётные дни: {even_time}\n'
+        f'Нечётные дни: {odd_time}\n'
+    )
+    if weekend_override:
+        desc += (
+            f'Выходные без работы: {weekend_no_work}\n'
+            f'Выходные с работой: {weekend_with_work}\n'
+            f'\nБот будет спрашивать накануне выходных,\n'
+            f'есть ли у вас работа на следующий день.'
+        )
+    desc += f'\n\nЧасовой пояс: {user_tz}'
+
+    # Определяем источник сообщения
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            desc,
+            reply_markup=get_main_menu_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            desc,
+            reply_markup=get_main_menu_keyboard()
+        )
+
+    logger.info(f"Пользователь {user_id} добавил расширенное ежедневное напоминание")
+
+    # Очищаем данные
+    context.user_data.pop('reminder', None)
+
+    return ConversationHandler.END
+
+
 async def receive_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получить время от пользователя"""
+    """Получить время от пользователя и сохранить напоминание"""
     user_id = update.effective_user.id
     time_str = update.message.text.strip()
 
@@ -280,16 +743,47 @@ async def receive_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(time_str) == 4:
         time_str = '0' + time_str
 
-    reminder_id = await add_reminder(user_id, time_str)
+    # Получаем данные напоминания из контекста
+    reminder_data = context.user_data.get('reminder', {})
+    frequency = reminder_data.get('frequency', 'daily')
+    day_of_week = reminder_data.get('day_of_week')
+    day_of_month = reminder_data.get('day_of_month')
+    month_fallback = reminder_data.get('month_fallback', 'last_day')
+
+    reminder_id = await add_reminder(
+        user_id=user_id,
+        time=time_str,
+        frequency=frequency,
+        day_of_week=day_of_week,
+        day_of_month=day_of_month,
+        month_fallback=month_fallback
+    )
+
     user_tz = await get_user_timezone(user_id)
+
+    # Формируем описание частоты
+    freq_desc = 'Ежедневно'
+    if frequency == 'weekly':
+        freq_desc = f'Еженедельно ({DAYS_OF_WEEK[day_of_week]})'
+    elif frequency == 'monthly':
+        fallback_text = 'последний день' if month_fallback == 'last_day' else 'пропустить'
+        if day_of_month > 28:
+            freq_desc = f'Ежемесячно ({day_of_month}-е, иначе {fallback_text})'
+        else:
+            freq_desc = f'Ежемесячно ({day_of_month}-е число)'
 
     await update.message.reply_text(
         f'Напоминание добавлено!\n\n'
         f'Время: {time_str}\n'
+        f'Частота: {freq_desc}\n'
         f'Часовой пояс: {user_tz}',
         reply_markup=get_main_menu_keyboard()
     )
-    logger.info(f"Пользователь {user_id} добавил напоминание на {time_str}")
+
+    logger.info(f"Пользователь {user_id} добавил напоминание: {time_str}, {frequency}")
+
+    # Очищаем данные
+    context.user_data.pop('reminder', None)
 
     return ConversationHandler.END
 
@@ -325,7 +819,8 @@ async def menu_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     keyboard = []
     for r in reminders:
-        text += f'• {r["time"]}\n'
+        freq_desc = get_frequency_description(r)
+        text += f'• {r["time"]} — {freq_desc}\n'
         keyboard.append([
             InlineKeyboardButton(f'Удалить {r["time"]}', callback_data=f'delete_{r["id"]}')
         ])
@@ -365,7 +860,8 @@ async def delete_reminder_callback(update: Update, context: ContextTypes.DEFAULT
 
     keyboard = []
     for r in reminders:
-        text += f'• {r["time"]}\n'
+        freq_desc = get_frequency_description(r)
+        text += f'• {r["time"]} — {freq_desc}\n'
         keyboard.append([
             InlineKeyboardButton(f'Удалить {r["time"]}', callback_data=f'delete_{r["id"]}')
         ])
@@ -525,14 +1021,16 @@ async def send_reminder_message(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Отправлено напоминание пользователю {user_id} (ID: {reminder_id})")
 
 
-async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """Проверка и отправка напоминаний"""
-    reminders = await get_all_active_reminders()
+async def check_weekend_work_questions(context: ContextTypes.DEFAULT_TYPE):
+    """Проверка и отправка вопросов о работе в выходные"""
+    from datetime import timedelta
+
+    reminders = await get_advanced_daily_reminders_needing_questions()
 
     for reminder in reminders:
         user_id = reminder['user_id']
         reminder_id = reminder['id']
-        reminder_time = reminder['time']
+        ask_work_time = reminder.get('ask_work_time', '18:00')
         user_tz_str = reminder['timezone']
 
         try:
@@ -542,6 +1040,142 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
         now = datetime.now(user_tz)
         today = now.date()
+        tomorrow = today + timedelta(days=1)
+
+        # Проверяем, является ли завтра выходным (Сб=5, Вс=6)
+        if tomorrow.weekday() not in (5, 6):
+            continue
+
+        # Проверяем, пора ли спрашивать
+        ask_hour, ask_minute = map(int, ask_work_time.split(':'))
+        ask_datetime = user_tz.localize(
+            datetime(today.year, today.month, today.day, ask_hour, ask_minute)
+        )
+
+        # Вопрос задаём в течение минуты после указанного времени
+        if not (ask_datetime <= now < ask_datetime + timedelta(minutes=1)):
+            continue
+
+        # Проверяем, был ли уже задан вопрос на эту дату
+        existing = await get_weekend_work_status(reminder_id, tomorrow)
+        if existing:
+            continue
+
+        # Создаём вопрос и отправляем его
+        await create_work_question(user_id, reminder_id, tomorrow)
+
+        day_name = 'субботу' if tomorrow.weekday() == 5 else 'воскресенье'
+        keyboard = [
+            [
+                InlineKeyboardButton("Да, работаю", callback_data=f'work_yes_{reminder_id}_{tomorrow.isoformat()}'),
+                InlineKeyboardButton("Нет, выходной", callback_data=f'work_no_{reminder_id}_{tomorrow.isoformat()}')
+            ]
+        ]
+
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f'Привет! Завтра {day_name}.\n\n'
+                     f'У тебя будет работа завтра?\n'
+                     f'(Это нужно для выбора времени напоминания)',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            logger.info(f"Отправлен вопрос о работе пользователю {user_id} на {tomorrow}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки вопроса о работе: {e}")
+
+
+async def work_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ответа на вопрос о работе в выходной"""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    user_id = query.from_user.id
+
+    # Парсим данные: work_yes_123_2025-01-25 или work_no_123_2025-01-25
+    if data.startswith('work_yes_'):
+        has_work = True
+        rest = data.replace('work_yes_', '')
+    elif data.startswith('work_no_'):
+        has_work = False
+        rest = data.replace('work_no_', '')
+    else:
+        return
+
+    parts = rest.rsplit('_', 1)
+    if len(parts) != 2:
+        return
+
+    try:
+        reminder_id = int(parts[0])
+        target_date = date.fromisoformat(parts[1])
+    except (ValueError, IndexError):
+        return
+
+    await set_weekend_work_status(user_id, reminder_id, target_date, has_work)
+
+    reminder = await get_reminder_by_id(reminder_id)
+    if not reminder:
+        await query.edit_message_text('Напоминание не найдено.')
+        return
+
+    if has_work:
+        time_to_use = reminder.get('weekend_time_with_work', reminder['time'])
+        status_text = 'с работой'
+    else:
+        time_to_use = reminder.get('weekend_time_no_work', reminder['time'])
+        status_text = 'без работы'
+
+    day_name = 'субботу' if target_date.weekday() == 5 else 'воскресенье'
+
+    await query.edit_message_text(
+        f'Принято! В {day_name} ({status_text}) напоминание придёт в {time_to_use}.'
+    )
+    logger.info(f"Пользователь {user_id} указал статус работы: {has_work} на {target_date}")
+
+
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Проверка и отправка напоминаний"""
+    reminders = await get_all_active_reminders()
+
+    for reminder in reminders:
+        user_id = reminder['user_id']
+        reminder_id = reminder['id']
+        user_tz_str = reminder['timezone']
+
+        try:
+            user_tz = pytz.timezone(user_tz_str)
+        except pytz.UnknownTimeZoneError:
+            user_tz = pytz.UTC
+
+        now = datetime.now(user_tz)
+        today = now.date()
+
+        # Проверяем, должно ли напоминание сработать сегодня (по частоте)
+        if not should_reminder_trigger(reminder, today):
+            continue
+
+        # Определяем время напоминания в зависимости от настроек
+        daily_mode = reminder.get('daily_mode', 'simple')
+
+        if reminder.get('frequency') == 'daily' and daily_mode == 'advanced':
+            # Для расширенного режима - определяем время в зависимости от дня и статуса работы
+            is_weekend = today.weekday() >= 5
+            has_work = None
+
+            if is_weekend and reminder.get('weekend_override'):
+                # Проверяем статус работы на сегодня
+                work_status = await get_weekend_work_status(reminder_id, today)
+                if work_status and work_status.get('responded'):
+                    has_work = bool(work_status.get('has_work'))
+
+            reminder_time = get_reminder_time_for_date(reminder, today, has_work)
+        else:
+            reminder_time = reminder['time']
+
+        if not reminder_time:
+            continue
 
         reminder_hour, reminder_minute = map(int, reminder_time.split(':'))
         reminder_datetime = user_tz.localize(
@@ -595,6 +1229,14 @@ async def post_init(application: Application):
     )
     logger.info("Планировщик напоминаний запущен")
 
+    application.job_queue.run_repeating(
+        check_weekend_work_questions,
+        interval=60,
+        first=15,
+        name='check_weekend_work_questions'
+    )
+    logger.info("Планировщик вопросов о работе запущен")
+
 
 def main():
     """Запуск бота"""
@@ -607,13 +1249,64 @@ def main():
     add_reminder_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_add_callback, pattern='^menu_add$')],
         states={
+            SELECTING_FREQUENCY: [
+                CallbackQueryHandler(select_frequency_callback, pattern=r'^freq_'),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
+            SELECTING_DAILY_MODE: [
+                CallbackQueryHandler(select_daily_mode_callback, pattern=r'^daily_'),
+                CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
+            WAITING_FOR_EVEN_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^Меню$'), receive_even_time),
+                CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
+            WAITING_FOR_ODD_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^Меню$'), receive_odd_time),
+                CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
+            SELECTING_WEEKEND_OVERRIDE: [
+                CallbackQueryHandler(select_weekend_override_callback, pattern=r'^weekend_'),
+                CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
+            WAITING_FOR_WEEKEND_NO_WORK_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^Меню$'), receive_weekend_no_work_time),
+                CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
+            WAITING_FOR_WEEKEND_WITH_WORK_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^Меню$'), receive_weekend_with_work_time),
+                CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
+            SELECTING_DAY_OF_WEEK: [
+                CallbackQueryHandler(select_day_of_week_callback, pattern=r'^dow_\d$'),
+                CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
+            SELECTING_DAY_OF_MONTH: [
+                CallbackQueryHandler(select_day_of_month_callback, pattern=r'^dom_\d+$'),
+                CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
+            SELECTING_MONTH_FALLBACK: [
+                CallbackQueryHandler(select_month_fallback_callback, pattern=r'^fallback_'),
+                CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
+                CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            ],
             WAITING_FOR_TIME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^Меню$'), receive_time),
+                CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
                 CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
             ],
         },
         fallbacks=[
             CallbackQueryHandler(cancel_conversation, pattern='^menu_back$'),
+            CallbackQueryHandler(back_to_frequency_callback, pattern='^back_to_frequency$'),
             CommandHandler("start", start),
             MessageHandler(filters.Regex('^Меню$'), menu_button_handler),
         ],
@@ -644,6 +1337,9 @@ def main():
 
     # Регистрация обработчика подтверждения приёма таблеток
     application.add_handler(CallbackQueryHandler(took_pills_callback, pattern=r'^took_pills_\d+$'))
+
+    # Регистрация обработчика ответа на вопрос о работе
+    application.add_handler(CallbackQueryHandler(work_status_callback, pattern=r'^work_(yes|no)_\d+_'))
 
     # Запуск бота
     logger.info("Бот успешно запущен!")
